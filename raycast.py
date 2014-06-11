@@ -3,14 +3,13 @@ import sys
 import math
 import random
 import itertools
-import pygame as pg
+
+import sdl # pysdl2-cffi
 
 from collections import namedtuple
 
-
 if sys.version_info[0] == 2:
     range = xrange
-
 
 CAPTION = "Raytracing with Python"
 SCREEN_SIZE = (1200, 600)
@@ -33,7 +32,7 @@ class Image(object):
         The image argument is a preloaded and converted pg.Surface object.
         """
         self.image = image
-        self.width, self.height = self.image.get_size()
+        self.width, self.height = sdl.queryTexture(image)[-2:]
 
 
 class Player(object):
@@ -73,13 +72,13 @@ class Player(object):
 
     def update(self, keys, dt, game_map):
         """Execute movement functions if the appropriate key is pressed."""
-        if keys[pg.K_LEFT]:
+        if keys[sdl.SCANCODE_LEFT]:
             self.rotate(-self.rotate_speed*dt)
-        if keys[pg.K_RIGHT]:
+        if keys[sdl.SCANCODE_RIGHT]:
             self.rotate(self.rotate_speed*dt)
-        if keys[pg.K_UP]:
+        if keys[sdl.SCANCODE_UP]:
             self.walk(self.speed*dt, game_map)
-        if keys[pg.K_DOWN]:
+        if keys[sdl.SCANCODE_DOWN]:
             self.walk(-self.speed*dt, game_map)
 
 
@@ -195,7 +194,7 @@ class Camera(object):
     """Handles the projection and rendering of all objects on the screen."""
     def __init__(self, screen, resolution):
         self.screen = screen
-        self.width, self.height = self.screen.get_size()
+        self.width, self.height = self.screen.getWindowSize()
         self.resolution = float(resolution)
         self.spacing = self.width/resolution
         self.field_of_view = FIELD_OF_VIEW
@@ -212,9 +211,15 @@ class Camera(object):
     def draw_sky(self, direction, sky):
         """Calculate the skies offset so that it wraps, and draw."""
         left = -sky.width*direction/CIRCLE
-        self.screen.blit(sky.image, (left,0))
+        renderer.renderCopy(sky.image, 
+                sdl.ffi.NULL,
+                (int(left), 0, 
+                 sky.width, sky.height))
         if left<sky.width-self.width:
-            self.screen.blit(sky.image, (left+sky.width,0))
+            renderer.renderCopy(sky.image, 
+                    sdl.ffi.NULL,
+                    (int(left)+sky.width, 0, 
+                     sky.width, sky.height))
 
     def draw_columns(self, player, game_map):
         """
@@ -244,11 +249,9 @@ class Camera(object):
             if ray_index == hit:
                 texture_x = int(math.floor(texture.width*step.offset))
                 wall = self.project(step.height, angle, step.distance)
-                image_location = pg.Rect(texture_x, 0, 1, texture.height)
-                image_slice = texture.image.subsurface(image_location)
-                scale_rect = pg.Rect(left, wall.top, width, wall.height)
-                scaled = pg.transform.scale(image_slice, scale_rect.size)
-                self.screen.blit(scaled, scale_rect)
+                image_location = sdl.Rect((texture_x, 0, 1, texture.height))
+                scale_rect = sdl.Rect(tuple(int(x) for x in (left, wall.top, width, wall.height)))
+                renderer.renderCopy(texture.image, image_location, scale_rect)
                 self.draw_shadow(step, scale_rect, game_map.light)
             self.draw_rain(step, angle, left, ray_index)
 
@@ -260,9 +263,10 @@ class Camera(object):
         shade_value = step.distance+step.shading
         max_light = shade_value/float(self.light_range-light)
         alpha = 255*min(1, max(max_light, 0))
-        shade_slice = pg.Surface(scale_rect.size).convert_alpha()
-        shade_slice.fill((0,0,0,alpha))
-        self.screen.blit(shade_slice, scale_rect)
+
+        renderer.setRenderDrawColor(0,0,0,int(alpha))
+        renderer.setRenderDrawBlendMode(sdl.BLENDMODE_BLEND)
+        renderer.renderFillRect(scale_rect)
 
     def draw_rain(self, step, angle, left, ray_index):
         """
@@ -272,10 +276,12 @@ class Camera(object):
         rain_drops = int(random.random()**3*ray_index)
         if rain_drops:
             rain = self.project(0.1, angle, step.distance)
-            drop = pg.Surface((1,rain.height)).convert_alpha()
-            drop.fill(RAIN_COLOR)
+        renderer.setRenderDrawColor(*RAIN_COLOR)
+        renderer.setRenderDrawBlendMode(sdl.BLENDMODE_BLEND)
         for _ in range(rain_drops):
-            self.screen.blit(drop, (left, random.random()*rain.top))
+            rain_top = int(random.random() * rain.top)
+            renderer.renderDrawLine(int(left), rain_top,
+                                    int(left), int(rain_top + rain.height))
 
     def draw_weapon(self, weapon, paces):
         """
@@ -286,7 +292,9 @@ class Camera(object):
         bob_y = math.sin(paces*4)*self.scale*6
         left = self.width*0.66+bob_x
         top = self.height*0.6+bob_y
-        self.screen.blit(weapon.image, (left, top))
+        renderer.renderCopy(weapon.image,
+                            sdl.ffi.NULL,
+                            (int(left), int(top), weapon.width, weapon.height))
 
     def project(self, height, angle, distance):
         """
@@ -306,74 +314,93 @@ class Control(object):
     processing events; updating; and rendering.
     """
     def __init__(self):
-        self.screen = pg.display.get_surface()
-        self.clock = pg.time.Clock()
+        # self.screen = pg.display.get_surface()
         self.fps = 60.0
-        self.keys = pg.key.get_pressed()
         self.done = False
         self.player = Player(15.3, -1.2, math.pi*0.3)
         self.game_map = GameMap(32)
-        self.camera = Camera(self.screen, 300)
+        self.camera = Camera(window, 300)
+        self.keys = None
 
     def event_loop(self):
         """
         Quit game on a quit event and update self.keys on any keyup or keydown.
         """
-        for event in pg.event.get():
-            if event.type == pg.QUIT:
+        event = sdl.Event()
+        while event.pollEvent():
+            if event.type == sdl.QUIT:
                 self.done = True
-            elif event.type in (pg.KEYDOWN, pg.KEYUP):
-                self.keys = pg.key.get_pressed()
 
     def update(self, dt):
         """Update the game_map and player."""
         self.game_map.update(dt)
-        self.player.update(self.keys, dt, self.game_map)
+        keys = sdl.getKeyboardState()[0] # (keystate, length)
+        self.player.update(keys, dt, self.game_map)
 
-    def display_fps(self):
+    def display_fps(self, fps):
         """Show the program's FPS in the window handle."""
-        caption = "{} - FPS: {:.2f}".format(CAPTION, self.clock.get_fps())
-        pg.display.set_caption(caption)
+        caption = "{} - FPS: {:.2f}".format(CAPTION, fps)
+        window.setWindowTitle(caption.encode('utf-8'))
 
     def main_loop(self):
         """Process events, update, and render."""
-        dt = self.clock.tick(self.fps)/1000.0
+        dt = sdl.getTicks() / 1000.
+        fps = 0
+        fps_reported = 0
         while not self.done:
             self.event_loop()
             self.update(dt)
             self.camera.render(self.player, self.game_map)
-            dt = self.clock.tick(self.fps)/1000.0
-            pg.display.update()
-            self.display_fps()
-
+            ticks = sdl.getTicks()
+            dt = (ticks / 1000.) - dt
+            renderer.renderPresent()
+            renderer.setRenderDrawColor(0,0,0,255)
+            renderer.renderClear()
+            fps += 1
+            if ticks - fps_reported > 1000: # report once a second
+                self.display_fps(fps)
+                fps = 0
+                fps_reported = ticks
 
 def load_resources():
     """
     Return a dictionary of our needed images; loaded, converted, and scaled.
     """
     images = {}
-    knife_image = pg.image.load("knife_hand.png").convert_alpha()
-    knife_w, knife_h = knife_image.get_size()
-    knife_scale = (int(knife_w*SCALE), int(knife_h*SCALE))
-    images["knife"] = pg.transform.smoothscale(knife_image, knife_scale)
-    images["texture"] = pg.image.load("wall_texture.jpg").convert()
+
+    knife_image = sdl.image.load("knife_hand.png")
+    try:
+        knife_w, knife_h = knife_image.w, knife_image.h
+        knife_scale = (int(knife_w*SCALE), int(knife_h*SCALE))
+        images["knife"] = renderer.createTextureFromSurface(knife_image)
+    finally:
+        sdl.freeSurface(knife_image)
+    images["texture"] = sdl.image.loadTexture(renderer, 'wall_texture.jpg')
     sky_size = int(SCREEN_SIZE[0]*(CIRCLE/FIELD_OF_VIEW)), SCREEN_SIZE[1]
-    sky_box_image = pg.image.load("deathvalley_panorama.jpg").convert()
-    images["sky"] = pg.transform.smoothscale(sky_box_image, sky_size)
+    sky_box_image = sdl.image.loadTexture(renderer, "deathvalley_panorama.jpg")
+    images["sky"] = sky_box_image
+
     return images
 
 
 def main():
     """Prepare the display, load images, and get our programming running."""
-    global IMAGES
+    global IMAGES, window, renderer
     os.environ["SDL_VIDEO_CENTERED"] = "True"
-    pg.init()
-    pg.display.set_mode(SCREEN_SIZE)
-    IMAGES = load_resources()
-    Control().main_loop()
-    pg.quit()
-    sys.exit()
-
+    sdl.init(sdl.INIT_VIDEO)
+    try:
+        window = sdl.createWindow(CAPTION.encode('utf-8'),
+                                  sdl.WINDOWPOS_CENTERED,
+                                  sdl.WINDOWPOS_CENTERED,
+                                  SCREEN_SIZE[0],
+                                  SCREEN_SIZE[1],
+                                  0)
+        window = sdl.Window(window)
+        renderer = sdl.Renderer(sdl.createRenderer(window, -1, 0))
+        IMAGES = load_resources()
+        Control().main_loop()
+    finally:
+        sdl.quit()
 
 if __name__ == "__main__":
     main()
